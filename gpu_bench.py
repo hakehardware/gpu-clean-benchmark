@@ -287,6 +287,32 @@ def main():
         }),
     }
 
+    # Decimated load-phase feed (last run's load) — this is what charts plot: the
+    # temp climb + clock sag that tell the throttle story. Relative t from load
+    # start; ~25 points. throttle_spans marks thermal/power-limited intervals.
+    load_phase = f"load{args.runs}"
+    load_samples = [s for s in sampler.samples if s["phase"] == load_phase]
+    samples_decimated = []
+    throttle_spans = []
+    if load_samples:
+        t0 = load_samples[0]["t"]
+        step = max(1, len(load_samples) // 25)
+        samples_decimated = [
+            {"t": round(s["t"] - t0, 1), "temp": s["temp"], "clock_sm": s["clock_sm"], "power": s["power"]}
+            for s in load_samples[::step]
+        ]
+        cur = None
+        for s in load_samples:
+            thr = bool(s["throttle_mask"] & THERMAL_POWER_BITS)
+            rt = round(s["t"] - t0, 1)
+            if thr and cur is None:
+                cur = rt
+            elif not thr and cur is not None:
+                throttle_spans.append({"start": cur, "end": rt})
+                cur = None
+        if cur is not None:
+            throttle_spans.append({"start": cur, "end": round(load_samples[-1]["t"] - t0, 1)})
+
     result = {
         "label": args.label,
         "gpu": gpu_name,
@@ -299,6 +325,8 @@ def main():
         },
         "runs": runs,
         "summary": summary,
+        "samples_decimated": samples_decimated,
+        "throttle_spans": throttle_spans,
     }
 
     out = args.out or f"./{args.label.replace(' ', '_').replace('/', '_')}.json"
