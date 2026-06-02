@@ -1,0 +1,9 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# benchmark output (results belong in the DustyFans DB, not this repo)
+*.json
+*_samples.csv
