@@ -24,13 +24,21 @@ Per card, in two phases — **before** (dirty, as received) and **after** (clean
   - **FP32 throughput (TFLOPS)** — a sustained matmul load, on cards new enough to run it (a secondary,
     modern-only number).
 - **Power and fan** — average board power and peak fan speed under load.
+- **Sustained-load soak (the stress test)** — beyond the short runs above, each phase also holds a ~15-minute
+  sustained load so the whole cooler reaches heat-soak equilibrium — exactly where a dirty card's degraded heat
+  transfer shows up. We record **time-to-throttle** (how long before *thermal* throttling begins — power-capping
+  from the start is normal and does not count), the **sustained throttle %** and worst held clock, **stability**
+  (crashes / compute artifacts / driver Xid events), and **fresh-vs-soaked retention** — the graphics score cool
+  vs after the soak (a clean card holds it; a dirty one sheds performance as it heats).
 - **Wide 1 Hz telemetry** — beyond temp/clock/power/fan we also log memory-junction temperature (where the card
   exposes it), memory-controller utilisation, performance state, the enforced power limit, and PCIe link
   gen/width. Where sensors are fitted we also log **room ambient temperature** and **isolated wall power** (a
   smart plug on the GPU's PSU only) — the latter is the one honest power number for older cards `nvidia-smi`
   can't report board power for.
-- **VRAM integrity** — a [`memtest_vulkan`](https://github.com/GpuZelenograd/memtest_vulkan) pass each phase
-  (Vulkan compute, so it runs on every card), recording pass / error count. **This is an honesty check, not a
+- **VRAM integrity (run hot)** — a [`memtest_vulkan`](https://github.com/GpuZelenograd/memtest_vulkan) pass at the
+  **end of the soak**, when the card is heat-soaked and memory-junction temperature is near its peak (marginal
+  memory can pass cold and fault hot — so we test it hot). Vulkan compute, so it runs on every card; records
+  pass / error count, each phase. **This is an honesty check, not a
   cleaning metric:** VRAM errors mean failing or marginal memory silicon, and cleaning a card does **not** repair
   that. We capture it before *and* after so an electrically sick card shows up as sick — never sold as if cleaning
   fixed it.
@@ -52,9 +60,10 @@ unimpressive and negative ones*.
 - **~1 Hz telemetry** is logged for the whole run (temp, clocks, power, fan, utilisation, throttle bitmask),
   which is what powers the temperature-vs-time and clock-vs-temperature curves.
 - Each run is: a short **idle baseline**, then a **sustained load** held to thermal steady state, then capture.
-- **VRAM + LLM after the thermal runs** — the memtest_vulkan pass and the llama.cpp tok/s ladder run once the
-  temperature story is captured. Both Vulkan tools are **pinned to the NVIDIA GPU** (our open-air rig also exposes
-  an integrated GPU as a Vulkan device), so device selection is deterministic across the batch.
+- **LLM after the thermal runs; VRAM hot at the end of the soak** — the llama.cpp tok/s ladder runs once the short
+  bench is captured; the memtest_vulkan VRAM pass runs at the end of the sustained soak (peak memory temperature).
+  Both Vulkan tools are **pinned to the NVIDIA GPU** (our open-air rig also exposes an integrated GPU as a Vulkan
+  device), so device selection is deterministic across the batch.
 - Cards run in an **open-air eGPU rig** (GPU on a riser with its own PSU), which keeps the thermal baseline
   consistent and makes swaps fast across a large batch.
 
@@ -87,11 +96,14 @@ and driver, and:
   both Vulkan, so the same tools work across card generations (incl. the legacy path)
 
 ```bash
-python3 gpu_bench.py --label "before" --runs 3 --idle-secs 30 --load-secs 120 --vram --llm
-python3 gpu_bench.py --label "after"  --runs 3 --idle-secs 30 --load-secs 120 --vram --llm
+# per phase (before, then after) — short bench: temps, throttle, glmark2, FP32, LLM tok/s
+python3 gpu_bench.py --label "before" --runs 3 --idle-secs 30 --load-secs 120 --llm
+# per phase — sustained heat soak: throttle ceiling, stability, fresh-vs-soaked retention, hot VRAM
+python3 gpu_bench.py --label "before" --soak-only --soak-secs 900 --vram
 ```
 
-`--vram` adds the memtest_vulkan pass; `--llm` runs the tok/s ladder over the models in `--models-dir`. Where a
+`--soak-only` runs the sustained heat soak — and with `--vram` it adds the hot memtest_vulkan pass at the end;
+`--llm` runs the tok/s ladder over the models in `--models-dir`. Where a
 metering smart plug / ambient probe are fitted, `--shelly-ip` and `--ambient-cmd` add isolated wall power and room
 ambient to the telemetry. It writes a JSON summary plus the raw 1 Hz samples as CSV. A legacy-driver variant (for
 Kepler-era cards that can't run current CUDA) emits the same `glmark2` universal score, the same VRAM/LLM (Vulkan)

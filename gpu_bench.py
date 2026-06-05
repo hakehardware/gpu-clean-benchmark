@@ -47,6 +47,9 @@ THROTTLE_BITS = {
 }
 # Bits that mean "the card is being held back by heat or power" — the headline.
 THERMAL_POWER_BITS = 0x0004 | 0x0008 | 0x0020 | 0x0040 | 0x0080
+# Thermal-only slowdown bits (sw/hw thermal). time-to-throttle keys on THESE, not the
+# combined mask — a card power-capping from t=0 is NORMAL, not the thermal story cleaning fixes.
+THERMAL_BITS = 0x0020 | 0x0040
 
 # --- Vulkan tooling (VRAM + LLM). The bench box exposes 3 Vulkan devices (NVIDIA +
 # AMD iGPU + llvmpipe), so PIN to the NVIDIA GPU by exposing only its ICD — that
@@ -251,6 +254,172 @@ def run_load(matrix, seconds):
     return (flops_per_iter * iters) / elapsed / 1e12
 
 
+def write_samples_csv(csv_path, samples):
+    """Write the widened raw 1Hz feed (shared by the bench + soak paths)."""
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t", "phase", "temp", "temp_mem", "clock_sm", "clock_mem", "power",
+                    "power_limit", "fan", "util", "util_mem", "pstate", "pcie_gen_cur",
+                    "pcie_width_cur", "voltage_mv", "ambient_c", "wall_power_w",
+                    "throttle_mask", "throttle"])
+        for s in samples:
+            w.writerow([s["t"], s["phase"], s["temp"], s["temp_mem"], s["clock_sm"],
+                        s["clock_mem"], s["power"], s["power_limit"], s["fan"], s["util"],
+                        s["util_mem"], s["pstate"], s["pcie_gen_cur"], s["pcie_width_cur"],
+                        s["voltage_mv"], s["ambient_c"], s["wall_power_w"],
+                        hex(s["throttle_mask"]), "|".join(s["throttle"])])
+
+
+def decimate(samples, maxpts=180):
+    """Down-sample to <=maxpts {t,temp,clock_sm,power} points (relative t) for a chart feed."""
+    if not samples:
+        return []
+    t0 = samples[0]["t"]
+    step = max(1, len(samples) // maxpts)
+    return [{"t": round(s["t"] - t0, 1), "temp": s["temp"], "clock_sm": s["clock_sm"], "power": s["power"]}
+            for s in samples[::step]]
+
+
+def dmesg_xid_count():
+    """Count NVIDIA Xid error lines in the kernel log (GPU faults). Needs root; None if unavailable."""
+    try:
+        out = subprocess.check_output(["dmesg"], text=True, stderr=subprocess.DEVNULL, timeout=10)
+        return sum(1 for ln in out.splitlines() if "xid" in ln.lower())
+    except Exception:
+        return None
+
+
+def run_soak(secs, matrix):
+    """Sustained-load HEALTH soak. Holds a FIXED FP32 matmul for `secs`, watching for a crash
+    (driver/kernel exception) and compute artifacts (NaN/Inf in a bounded, non-chained matmul =
+    a real compute/memory fault, not arithmetic overflow). Telemetry is sampled by the caller
+    (phase 'soak'). Returns {crashed, artifacts, iters, secs}."""
+    import torch
+
+    dev = torch.device("cuda")
+    a = torch.randn(matrix, matrix, device=dev, dtype=torch.float32)
+    b = torch.randn(matrix, matrix, device=dev, dtype=torch.float32)
+    torch.cuda.synchronize()
+    crashed = False
+    artifacts = False
+    iters = 0
+    start = time.monotonic()
+    try:
+        while time.monotonic() - start < secs:
+            c = a @ b                      # fixed inputs -> bounded values; no overflow
+            iters += 1
+            if iters % 25 == 0:
+                torch.cuda.synchronize()
+                if bool(torch.isnan(c).any()) or bool(torch.isinf(c).any()):
+                    artifacts = True       # NaN/Inf from a bounded matmul = compute/memory fault
+        torch.cuda.synchronize()
+    except Exception as e:                  # GPU fell over / driver reset
+        crashed = True
+        print(f"  soak crashed: {e}", file=sys.stderr)
+    return {"crashed": crashed, "artifacts": artifacts, "iters": iters,
+            "secs": round(time.monotonic() - start, 1)}
+
+
+def run_soak_phase(args, gpu_name, gpu_uuid):
+    """Suite B (health gate): one long sustained load + 1Hz telemetry, classified pass/marginal/fail.
+    Writes <label>.json (soak summary + decimated curve) + _samples.csv for record_card_qa."""
+    sampler = Sampler(args.gpu, shelly_ip=args.shelly_ip, ambient_cmd=args.ambient_cmd)
+    sampler.start()
+    x0 = dmesg_xid_count()
+    # Fresh graphics score (card cool) — the retention baseline.
+    perf_fresh = None
+    if not args.no_glmark2:
+        sampler.set_phase("glmark2_fresh")
+        print("[soak] glmark2 fresh (cool) ...", flush=True)
+        perf_fresh = run_glmark2(args.display, args.glmark2_args.split())
+    # The heat soak.
+    sampler.set_phase("soak")
+    print(f"[soak] sustained load {args.soak_secs}s (matrix {args.matrix}) ...", flush=True)
+    res = run_soak(args.soak_secs, args.matrix)
+    # Hot graphics score (immediately after the load, still heat-soaked) -> retention.
+    perf_soaked = None
+    if not args.no_glmark2:
+        sampler.set_phase("glmark2_hot")
+        print("[soak] glmark2 hot (soaked) ...", flush=True)
+        perf_soaked = run_glmark2(args.display, args.glmark2_args.split())
+    # Hot VRAM-integrity pass — the card is heat-soaked, so mem-junction is near its ceiling.
+    # memtest_vulkan faults here surface marginal memory a cold pass would miss (cleaning never
+    # repairs silicon). Runs after the hot glmark2 so it doesn't perturb the retention reading.
+    vram_result = None
+    if args.vram:
+        sampler.set_phase("vram")
+        print(f"[soak] memtest_vulkan {args.vram_secs}s (hot, pinned to NVIDIA) ...", flush=True)
+        vram_result = run_vram(args.vram_secs)
+        print(f"  vram_test_status={vram_result.get('vram_test_status')}", flush=True)
+    sampler.stop()
+    sampler.join(timeout=3)
+    x1 = dmesg_xid_count()
+    new_xid = (x1 - x0) if (x0 is not None and x1 is not None) else None
+
+    soak = [s for s in sampler.samples if s["phase"] == "soak"]
+    loaded = [s for s in soak if (s.get("util") or 0) > 50] or soak
+    temps = [s["temp"] for s in loaded if s["temp"] is not None]
+    clocks = [s["clock_sm"] for s in loaded if s["clock_sm"] is not None]
+    masks = [s["throttle_mask"] for s in loaded]
+    hw_bits = 0x0008 | 0x0040 | 0x0080        # hw_slowdown / hw_thermal / hw_power_brake = emergency
+    hw_throttle = any(m & hw_bits for m in masks)
+    sw_thermal_pct = round(100 * sum(1 for m in masks if m & 0x0020) / len(masks), 1) if masks else None
+    throttle_pct = round(100 * sum(1 for m in masks if m & THERMAL_POWER_BITS) / len(masks), 1) if masks else None
+    reasons = sorted({r for s in loaded for r in s["throttle"] if r != "idle"})
+
+    # Time-to-THERMAL-throttle: first moment thermal limiting kicks in, relative to soak start
+    # ("throttles after ~N min"). Thermal bits only — power-capping from t=0 is normal, not the
+    # cleaning story. None = no thermal throttle the whole soak.
+    t0 = soak[0]["t"] if soak else None
+    ttt = next((round(s["t"] - t0, 1) for s in soak
+                if t0 is not None and (s["throttle_mask"] & THERMAL_BITS)), None)
+
+    # Fresh-vs-soaked retention: graphics score cool vs heat-soaked — "keeps N% of its
+    # performance when hot". A clean card holds it; a dirty card sheds it as the cooler saturates.
+    retention_pct = round(100 * perf_soaked / perf_fresh, 1) if (perf_fresh and perf_soaked) else None
+
+    crashed = res["crashed"] or bool(new_xid)
+    artifacts = res["artifacts"]
+    # Proposed verdict (owner confirms via record_card_qa): hardware throttle / crash / artifacts =
+    # fail; sustained SOFTWARE thermal limiting = marginal; power-cap alone is normal = pass.
+    if crashed or artifacts or hw_throttle:
+        health = "fail"
+    elif (sw_thermal_pct or 0) > 30:
+        health = "marginal"
+    else:
+        health = "pass"
+
+    soak_result = {
+        "label": args.label, "gpu": gpu_name, "gpu_uuid": gpu_uuid,
+        "soak_secs": int(res["secs"]),
+        "soak_temp_max": max(temps) if temps else None,
+        "soak_clock_sm_min": min(clocks) if clocks else None,
+        "soak_throttle_pct": throttle_pct,
+        "soak_sw_thermal_pct": sw_thermal_pct,
+        "soak_crashed": crashed,
+        "soak_artifacts": artifacts,
+        "soak_xid_delta": new_xid,
+        "soak_iters": res["iters"],
+        "soak_reasons": reasons,
+        "soak_time_to_throttle_s": ttt,
+        "soak_perf_fresh_glmark2": perf_fresh,
+        "soak_perf_soaked_glmark2": perf_soaked,
+        "soak_retention_pct": retention_pct,
+        "vram": vram_result,   # hot memtest_vulkan VRAM-integrity (--vram); None if not run
+        "health_result": health,
+        "soak_samples_decimated": decimate(soak),
+    }
+    out = args.out or f"./{args.label.replace(' ', '_').replace('/', '_')}.json"
+    with open(out, "w") as f:
+        json.dump(soak_result, f, indent=2)
+    write_samples_csv(os.path.splitext(out)[0] + "_samples.csv", sampler.samples)
+    print(f"\nwrote {out} and {os.path.splitext(out)[0]}_samples.csv")
+    print(json.dumps({k: soak_result[k] for k in (
+        "soak_secs", "soak_temp_max", "soak_clock_sm_min", "soak_throttle_pct",
+        "soak_time_to_throttle_s", "soak_retention_pct",
+        "soak_crashed", "soak_artifacts", "soak_xid_delta", "health_result")}, indent=2))
+
+
 def summarize_phase(samples, phase, tail_secs=None):
     """Aggregate samples for a phase. tail_secs -> only the last N seconds
     (used for load steady-state, ignoring the ramp)."""
@@ -427,10 +596,13 @@ def main():
                     help="Shelly plug IP (eGPU PSU) for isolated wall power; else NULL")
     ap.add_argument("--ambient-cmd", default=os.environ.get("BENCH_AMBIENT_CMD"),
                     help="shell command printing room ambient °C; else NULL")
-    ap.add_argument("--vram", action="store_true", help="run memtest_vulkan VRAM-integrity pass")
+    ap.add_argument("--vram", action="store_true", help="run memtest_vulkan VRAM-integrity pass (hot, at the end of the soak)")
     ap.add_argument("--vram-secs", type=int, default=120, help="VRAM test duration")
     ap.add_argument("--llm", action="store_true", help="run the llama.cpp tok/s rung ladder")
     ap.add_argument("--models-dir", default=MODELS_DIR, help="dir holding the rung GGUF models")
+    ap.add_argument("--soak-only", action="store_true",
+                    help="run ONLY the health soak (Suite B): one long load -> <label>.json for record_card_qa")
+    ap.add_argument("--soak-secs", type=int, default=900, help="soak duration (default 15 min)")
     ap.add_argument("--out", default=None, help="JSON output path (default: ./<label>.json)")
     args = ap.parse_args()
 
@@ -451,6 +623,11 @@ def main():
     ).strip()
     mem_total_mib = int(float(mem_total_raw)) if _num(mem_total_raw) is not None else None
 
+    # Suite B (health soak) is a separate, post-clean run -> card_qa, not a bench phase.
+    if args.soak_only:
+        run_soak_phase(args, gpu_name, gpu_uuid)
+        return
+
     sampler = Sampler(args.gpu, shelly_ip=args.shelly_ip, ambient_cmd=args.ambient_cmd)
     sampler.start()
     runs = []
@@ -470,11 +647,8 @@ def main():
             sampler.set_phase("glmark2")
             glmark2_score = run_glmark2(args.display, args.glmark2_args.split())
             print(f"  glmark2_score={glmark2_score}", flush=True)
-        if args.vram:
-            print("[vram] memtest_vulkan (pinned to NVIDIA) ...", flush=True)
-            sampler.set_phase("vram")
-            vram_result = run_vram(args.vram_secs)
-            print(f"  vram_test_status={vram_result.get('vram_test_status')}", flush=True)
+        # VRAM-integrity moved to the soak (run HOT — see run_soak_phase); the bench no longer
+        # runs memtest. vram_result stays None here; the JSON keeps the (now-null) key for compat.
         if args.llm:
             print("[llm] llama.cpp rung ladder (pinned to NVIDIA) ...", flush=True)
             sampler.set_phase("llm")
@@ -561,18 +735,7 @@ def main():
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
     csv_path = os.path.splitext(out)[0] + "_samples.csv"
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["t", "phase", "temp", "temp_mem", "clock_sm", "clock_mem", "power",
-                    "power_limit", "fan", "util", "util_mem", "pstate", "pcie_gen_cur",
-                    "pcie_width_cur", "voltage_mv", "ambient_c", "wall_power_w",
-                    "throttle_mask", "throttle"])
-        for s in sampler.samples:
-            w.writerow([s["t"], s["phase"], s["temp"], s["temp_mem"], s["clock_sm"],
-                        s["clock_mem"], s["power"], s["power_limit"], s["fan"], s["util"],
-                        s["util_mem"], s["pstate"], s["pcie_gen_cur"], s["pcie_width_cur"],
-                        s["voltage_mv"], s["ambient_c"], s["wall_power_w"],
-                        hex(s["throttle_mask"]), "|".join(s["throttle"])])
+    write_samples_csv(csv_path, sampler.samples)
 
     print(f"\nwrote {out} and {csv_path}")
     print(json.dumps(summary, indent=2))
