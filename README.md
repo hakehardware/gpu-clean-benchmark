@@ -105,7 +105,8 @@ python3 gpu_bench.py --label "before" --soak-only --soak-secs 900 --vram
 `--soak-only` runs the sustained heat soak — and with `--vram` it adds the hot memtest_vulkan pass at the end;
 `--llm` runs the tok/s ladder over the models in `--models-dir`. Where a
 metering smart plug / ambient probe are fitted, `--shelly-ip` and `--ambient-cmd` add isolated wall power and room
-ambient to the telemetry. It writes a JSON summary plus the raw 1 Hz samples as CSV. A legacy-driver variant (for
+ambient to the telemetry (`read_ambient.py` is our `--ambient-cmd` reader for the PCsensor TEMPer2 V4.1 — it prefers
+the external probe, since the in-body sensor self-heats a couple of degrees next to the chassis). It writes a JSON summary plus the raw 1 Hz samples as CSV. A legacy-driver variant (for
 Kepler-era cards that can't run current CUDA) emits the same `glmark2` universal score, the same VRAM/LLM (Vulkan)
 numbers, and the same phase/run/sample shape.
 
