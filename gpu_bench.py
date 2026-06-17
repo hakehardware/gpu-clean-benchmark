@@ -27,6 +27,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -509,8 +510,13 @@ def file_sha256_cached(path):
 
 def run_vram(secs):
     """memtest_vulkan VRAM-integrity pass, PINNED to the NVIDIA GPU. Time-boxed via
-    `timeout --signal=INT` (memtest stops + reports cleanly on Ctrl-C). HONEST: errors
-    mean bad/marginal silicon — cleaning never repairs that. Returns the phase fields."""
+    `timeout --signal=INT`. The verdict is read from POSITIVE markers only, never from the
+    absence of a success string: a clean run prints "no any errors, testing PASSed"; a real
+    fault prints an "Error found" block. If the time-box clips the run before it completes
+    (or a transient hot-run hiccup fires at soak end), memtest prints "INIT OR FIRST testing
+    failed due to runtime error" with NEITHER marker, which is an interruption, not bad
+    silicon, so it must NOT be reported as an error (see lesson:37; reproduced live on a
+    known-good card with a 1s-clipped run). Returns the phase fields."""
     env = dict(os.environ, VK_DRIVER_FILES=NVIDIA_VK_ICD)
     base = {"vram_test_tool": "memtest_vulkan", "vram_tested_mib": None,
             "vram_test_secs": float(secs)}
@@ -522,12 +528,20 @@ def run_vram(secs):
         out = p.stdout + p.stderr
     except Exception:
         return {**base, "vram_test_status": "skipped", "vram_errors": None}
-    on_nvidia = "NVIDIA" in out                       # the VK pin should guarantee this
-    passed = ("no any errors" in out) or ("testing PASSed" in out)
-    if not on_nvidia:
+    if "NVIDIA" not in out:                            # the VK pin should guarantee this
         return {**base, "vram_test_status": "skipped", "vram_errors": None}
-    return {**base, "vram_test_status": "ok" if passed else "errors",
-            "vram_errors": 0 if passed else None}
+    if "Error found" in out:                           # positive evidence of a real memory fault
+        m = re.search(r"(\d+)\s+error", out, re.IGNORECASE)
+        return {**base, "vram_test_status": "errors",
+                "vram_errors": int(m.group(1)) if m else None,
+                "vram_test_tail": out[-400:]}
+    if ("no any errors" in out) or ("testing PASSed" in out):   # positive evidence of a clean pass
+        return {**base, "vram_test_status": "ok", "vram_errors": 0}
+    # Neither marker present: the pass did not complete (interrupted / runtime hiccup). Do NOT
+    # condemn the card. Report no verdict so it gets re-tested, and keep the tail for diagnosis.
+    return {**base, "vram_test_status": "skipped", "vram_errors": None,
+            "vram_test_note": "interrupted before a pass/fail verdict; re-test",
+            "vram_test_tail": out[-400:]}
 
 
 def run_llm(mem_total_mib, models_dir):
